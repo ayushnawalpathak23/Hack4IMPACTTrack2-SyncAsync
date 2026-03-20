@@ -576,59 +576,95 @@ async function startServer() {
     }
 
     try {
-      const apiKey = process.env.GOOGLE_CLOUD_API_KEY || process.env.GEMINI_API_KEY;
-      if (!apiKey || apiKey === "MY_GOOGLE_CLOUD_API_KEY") {
-        console.error("GOOGLE_CLOUD_API_KEY or GEMINI_API_KEY is missing or invalid.");
-        return res.status(500).json({ error: "Google Cloud API key is not configured correctly." });
-      }
-
-      const translate = new Translate({ key: apiKey });
-      
-      // If text is a JSON string (as sent by the client), we need to translate its values
-      let textToTranslate = text;
-      let isJson = false;
+      let parsedJson: any = null;
+      let isJsonPayload = false;
       try {
-        const parsed = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null) {
-          isJson = true;
-          // Translate each value in the object
-          const translatedObj: any = {};
-          for (const [key, value] of Object.entries(parsed)) {
-            if (typeof value === 'string') {
-              const [translation] = await translate.translate(value, targetLanguage);
-              translatedObj[key] = translation;
-            } else if (Array.isArray(value)) {
-              const translatedArray = [];
-              for (const item of value) {
-                if (typeof item === 'object' && item !== null) {
-                   // Handle concerns array specifically
-                   const translatedItem: any = {};
-                   for (const [iKey, iValue] of Object.entries(item)) {
-                     if (typeof iValue === 'string' && iKey !== 'severity') {
-                       const [iTranslation] = await translate.translate(iValue, targetLanguage);
-                       translatedItem[iKey] = iTranslation;
-                     } else {
-                       translatedItem[iKey] = iValue;
-                     }
-                   }
-                   translatedArray.push(translatedItem);
-                } else {
-                  translatedArray.push(item);
-                }
-              }
-              translatedObj[key] = translatedArray;
-            } else {
-              translatedObj[key] = value;
-            }
-          }
-          return res.json({ translatedText: JSON.stringify(translatedObj) });
-        }
-      } catch (e) {
-        // Not JSON, proceed with normal translation
+        parsedJson = JSON.parse(text);
+        isJsonPayload = typeof parsedJson === "object" && parsedJson !== null;
+      } catch {
+        isJsonPayload = false;
       }
 
-      const [translation] = await translate.translate(textToTranslate, targetLanguage);
-      res.json({ translatedText: translation });
+      // First try Google Cloud Translation when configured.
+      const googleApiKey = process.env.GOOGLE_CLOUD_API_KEY || process.env.GEMINI_API_KEY;
+      if (googleApiKey && googleApiKey !== "MY_GOOGLE_CLOUD_API_KEY") {
+        try {
+          const translate = new Translate({ key: googleApiKey });
+
+          if (isJsonPayload) {
+            const translatedObj: any = {};
+            for (const [key, value] of Object.entries(parsedJson)) {
+              if (typeof value === "string") {
+                const [translation] = await translate.translate(value, targetLanguage);
+                translatedObj[key] = translation;
+              } else if (Array.isArray(value)) {
+                const translatedArray = [];
+                for (const item of value) {
+                  if (typeof item === "object" && item !== null) {
+                    const translatedItem: any = {};
+                    for (const [iKey, iValue] of Object.entries(item)) {
+                      if (typeof iValue === "string" && iKey !== "severity") {
+                        const [iTranslation] = await translate.translate(iValue, targetLanguage);
+                        translatedItem[iKey] = iTranslation;
+                      } else {
+                        translatedItem[iKey] = iValue;
+                      }
+                    }
+                    translatedArray.push(translatedItem);
+                  } else {
+                    translatedArray.push(item);
+                  }
+                }
+                translatedObj[key] = translatedArray;
+              } else {
+                translatedObj[key] = value;
+              }
+            }
+            return res.json({ translatedText: JSON.stringify(translatedObj) });
+          }
+
+          const [translation] = await translate.translate(text, targetLanguage);
+          return res.json({ translatedText: translation });
+        } catch (googleErr) {
+          console.error("Google translation failed, falling back to Groq:", googleErr);
+        }
+      }
+
+      // Fallback: Groq translation, including JSON-safe translation for report payloads.
+      if (isJsonPayload) {
+        const raw = await generateWithGroq(
+          [
+            {
+              role: "system",
+              content: "Translate report JSON values to target language. Keep keys identical. Preserve severity values exactly as one of: Normal, Caution, Critical. Return only valid JSON.",
+            },
+            {
+              role: "user",
+              content: `Target language: ${targetLanguage}\n\nJSON:\n${JSON.stringify(parsedJson)}`,
+            },
+          ],
+          true
+        );
+
+        let translatedJson: any;
+        try {
+          translatedJson = JSON.parse(raw);
+        } catch {
+          translatedJson = JSON.parse(extractJsonObject(raw));
+        }
+
+        return res.json({ translatedText: JSON.stringify(translatedJson) });
+      }
+
+      const translatedText = await generateWithGroq(
+        [
+          { role: "system", content: "You are a translation assistant. Return only translated text." },
+          { role: "user", content: `Translate to ${targetLanguage}:\n\n${String(text)}` },
+        ],
+        false
+      );
+
+      return res.json({ translatedText: translatedText.trim() });
     } catch (err) {
       console.error("Translation error:", err);
       res.status(500).json({ error: "Translation failed" });
@@ -637,24 +673,135 @@ async function startServer() {
 
   // TTS route
   app.post("/api/tts", async (req, res) => {
-    const { text } = req.body;
+    const { text, targetLang } = req.body;
     if (!text) {
       return res.status(400).json({ error: "Missing text" });
     }
 
+    const ttsLanguageMap: Record<string, string> = {
+      en: "en-US",
+      hi: "hi-IN",
+      or: "or-IN",
+      mr: "mr-IN",
+      te: "te-IN",
+      bn: "bn-IN",
+      ta: "ta-IN",
+      kn: "kn-IN",
+      gu: "gu-IN",
+      ml: "ml-IN",
+      pa: "pa-IN",
+    };
+
+    const langNameMap: Record<string, string> = {
+      en: "English",
+      hi: "Hindi",
+      or: "Odia",
+      mr: "Marathi",
+      te: "Telugu",
+      bn: "Bengali",
+      ta: "Tamil",
+      kn: "Kannada",
+      gu: "Gujarati",
+      ml: "Malayalam",
+      pa: "Punjabi",
+    };
+
     try {
+      const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
+      const defaultVoiceId = process.env.ELEVENLABS_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
+      const indianVoiceFallback = process.env.ELEVENLABS_VOICE_ID_INDIAN;
+      const languageKey = String(targetLang || "en").toLowerCase();
+      const languageVoiceMap: Record<string, string | undefined> = {
+        en: process.env.ELEVENLABS_VOICE_ID_EN,
+        hi: process.env.ELEVENLABS_VOICE_ID_HI,
+        bn: process.env.ELEVENLABS_VOICE_ID_BN,
+        or: process.env.ELEVENLABS_VOICE_ID_OR,
+      };
+      const elevenLabsVoiceId = languageVoiceMap[languageKey] || indianVoiceFallback || defaultVoiceId;
+
+      let spokenText = String(text);
+      {
+        try {
+          const rewriteInstruction =
+            languageKey === "en"
+              ? "Rewrite medical text for clear spoken narration in Indian English. Keep meaning intact, expand abbreviations naturally, and break long sentences into short sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text."
+              : "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, expand abbreviations naturally, and break long sentences into shorter sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text.";
+          const spokenRewrite = await generateWithGroq(
+            [
+              {
+                role: "system",
+                content: rewriteInstruction,
+              },
+              {
+                role: "user",
+                content: `Language: ${langNameMap[languageKey] || languageKey}\n\nText:\n${spokenText}`,
+              },
+            ],
+            false
+          );
+          if (spokenRewrite?.trim()) {
+            spokenText = spokenRewrite.trim();
+          }
+        } catch (rewriteErr) {
+          console.error("TTS spoken-text rewrite failed, using original text:", rewriteErr);
+        }
+      }
+
+      if (elevenLabsApiKey) {
+        try {
+          const elevenResponse = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenLabsVoiceId}`, {
+            method: "POST",
+            headers: {
+              "xi-api-key": elevenLabsApiKey,
+              "Content-Type": "application/json",
+              "Accept": "audio/mpeg",
+            },
+            body: JSON.stringify({
+              text: spokenText,
+              model_id: "eleven_multilingual_v2",
+              voice_settings: {
+                stability: 0.45,
+                similarity_boost: 0.75,
+              },
+            }),
+          });
+
+          if (elevenResponse.ok) {
+            const audioArrayBuffer = await elevenResponse.arrayBuffer();
+            const audioBase64 = Buffer.from(audioArrayBuffer).toString("base64");
+            return res.json({ audioData: audioBase64 });
+          }
+
+          const elevenErr = await elevenResponse.text();
+          console.error("ElevenLabs TTS failed, falling back to Google TTS:", elevenErr);
+        } catch (elevenCatchErr) {
+          console.error("ElevenLabs TTS exception, falling back to Google TTS:", elevenCatchErr);
+        }
+      }
+
       const apiKey = process.env.GOOGLE_CLOUD_API_KEY || process.env.GEMINI_API_KEY;
       if (!apiKey || apiKey === "MY_GOOGLE_CLOUD_API_KEY") {
-        console.error("GOOGLE_CLOUD_API_KEY or GEMINI_API_KEY is missing or invalid.");
-        return res.status(500).json({ error: "Google Cloud API key is not configured correctly." });
+        console.error("No usable TTS provider configured. Set ELEVENLABS_API_KEY or enable Google Cloud TTS.");
+        return res.status(500).json({ error: "No usable TTS provider configured." });
       }
 
       const client = new TextToSpeechClient({ apiKey });
+      const languageCode = ttsLanguageMap[String(targetLang || "en")] || "en-US";
+      const googleVoiceNameMap: Record<string, string | undefined> = {
+        en: "en-IN-Standard-D",
+        hi: "hi-IN-Standard-A",
+      };
+      const preferredGoogleVoice = googleVoiceNameMap[languageKey];
       
       const request = {
-        input: { text },
-        voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' as const },
-        audioConfig: { audioEncoding: 'MP3' as const },
+        input: { text: spokenText },
+        voice: preferredGoogleVoice
+          ? { languageCode, name: preferredGoogleVoice }
+          : { languageCode, ssmlGender: 'NEUTRAL' as const },
+        audioConfig: {
+          audioEncoding: 'MP3' as const,
+          speakingRate: (languageKey !== "en" && languageKey !== "hi") ? 0.82 : 0.95,
+        },
       };
 
       const [response] = await client.synthesizeSpeech(request);
