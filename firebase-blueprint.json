@@ -1,0 +1,70 @@
+{
+  "entities": {
+    "SimplifiedReport": {
+      "title": "SimplifiedReport",
+      "description": "A record of a simplified medical report.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who created this report."
+        },
+        "originalText": {
+          "type": "string",
+          "description": "The original complex medical text."
+        },
+        "simplifiedData": {
+          "type": "object",
+          "description": "Structured simplified data.",
+          "properties": {
+            "summary": { "type": "string" },
+            "concerns": { 
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "item": { "type": "string" },
+                  "severity": { "type": "string", "enum": ["Normal", "Caution", "Critical"] }
+                }
+              }
+            },
+            "meaning": { "type": "string" }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the report was simplified."
+        },
+        "title": {
+          "type": "string",
+          "description": "A short title for the report."
+        }
+      },
+      "required": ["userId", "originalText", "simplifiedData", "createdAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A message in a chat about a report.",
+      "type": "object",
+      "properties": {
+        "reportId": { "type": "string" },
+        "userId": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "text": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["reportId", "userId", "role", "text", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/reports/{reportId}": {
+      "schema": "SimplifiedReport",
+      "description": "Collection of simplified medical reports."
+    },
+    "/reports/{reportId}/messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Messages for a specific report chat."
+    }
+  }
+}

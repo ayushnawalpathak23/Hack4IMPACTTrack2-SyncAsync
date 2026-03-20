@@ -1,0 +1,7 @@
+{
+  "name": "MediCode",
+  "description": "A full-stack application that uses AI to simplify complex medical reports into easy-to-understand language.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
