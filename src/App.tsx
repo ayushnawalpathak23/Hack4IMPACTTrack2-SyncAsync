@@ -525,6 +525,33 @@ function MedicalSimplifier() {
     pa: "Punjabi",
   };
 
+  const TTS_LANG_MAP: Record<string, string> = {
+    en: "en-US",
+    hi: "hi-IN",
+    or: "or-IN",
+    mr: "mr-IN",
+    te: "te-IN",
+    bn: "bn-IN",
+    ta: "ta-IN",
+    kn: "kn-IN",
+    gu: "gu-IN",
+    ml: "ml-IN",
+    pa: "pa-IN",
+  };
+
+  const getPreferredVoice = (locale: string): SpeechSynthesisVoice | null => {
+    if (!("speechSynthesis" in window)) return null;
+    const voices = window.speechSynthesis.getVoices();
+    if (!voices.length) return null;
+
+    const exact = voices.find((voice) => voice.lang.toLowerCase() === locale.toLowerCase());
+    if (exact) return exact;
+
+    const prefix = locale.split("-")[0].toLowerCase();
+    const byPrefix = voices.find((voice) => voice.lang.toLowerCase().startsWith(prefix));
+    return byPrefix || null;
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reportText && !file) {
@@ -736,6 +763,7 @@ function MedicalSimplifier() {
     }
 
     setTranslating(true);
+    setError(null);
     try {
       const response = await fetch("/api/translate", {
         method: "POST",
@@ -746,6 +774,9 @@ function MedicalSimplifier() {
         })
       });
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || "Translation failed");
+      }
       if (data.translatedText) {
         try {
           // Clean up potential markdown code blocks from AI response
@@ -757,10 +788,13 @@ function MedicalSimplifier() {
           });
         } catch (e) {
           console.error("Failed to parse translated JSON:", e);
+          setError("Translation response could not be parsed. Please retry.");
         }
       }
     } catch (err) {
       console.error("Translation error:", err);
+      const msg = err instanceof Error ? err.message : "Translation failed";
+      setError(msg);
     } finally {
       setTranslating(false);
     }
@@ -772,27 +806,12 @@ function MedicalSimplifier() {
       stopSpeaking();
     }
 
-    if ("speechSynthesis" in window) {
-      setSpeaking(true);
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = targetLang === "en" ? "en-US" : targetLang;
-      utterance.rate = 1;
-      utterance.onend = () => setSpeaking(false);
-      utterance.onerror = () => {
-        setSpeaking(false);
-        setError("Text-to-speech failed in browser. Please check browser sound settings.");
-      };
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(utterance);
-      return;
-    }
-
     setSpeaking(true);
     try {
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, targetLang })
       });
       const data = await response.json();
       if (data.audioData) {
@@ -830,15 +849,37 @@ function MedicalSimplifier() {
         
         await audio.play();
       } else {
-        setSpeaking(false);
+        throw new Error("No audio data returned from server TTS");
       }
     } catch (err) {
-      console.error("TTS error:", err);
+      console.error("Server TTS error, trying browser fallback:", err);
+
+      if ("speechSynthesis" in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        const locale = TTS_LANG_MAP[targetLang] || "en-US";
+        utterance.lang = locale;
+        const selectedVoice = getPreferredVoice(locale);
+        if (selectedVoice) {
+          utterance.voice = selectedVoice;
+        }
+        utterance.rate = 1;
+        utterance.onend = () => setSpeaking(false);
+        utterance.onerror = () => {
+          setSpeaking(false);
+          setError("Text-to-speech failed. Server and browser voices were unavailable.");
+        };
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+        return;
+      }
+
       setSpeaking(false);
+      setError("Text-to-speech failed. No voice engine available.");
     }
   };
 
   const handleListen = () => speakText(currentReport?.simplifiedData.summary || "");
+  const handleListenMeaning = () => speakText(currentReport?.simplifiedData.meaning || "");
 
   if (sessionLoading) {
     return (
@@ -1176,6 +1217,12 @@ function MedicalSimplifier() {
                                   <option value="pa" className="text-slate-900">Punjabi (ਪੰਜਾਬੀ)</option>
                                 </select>
                               </div>
+                              {translating && (
+                                <div className="flex items-center gap-1 text-white/90 text-xs font-semibold bg-white/10 rounded-lg px-2 py-1">
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                  Translating...
+                                </div>
+                              )}
                               <button
                                 onClick={() => setCurrentReport(null)}
                                 className="text-white/80 hover:text-white text-sm font-medium transition-colors"
@@ -1261,6 +1308,14 @@ function MedicalSimplifier() {
                                 <div className="prose prose-sm prose-blue max-w-none">
                                   <ReactMarkdown>{currentReport.simplifiedData.meaning}</ReactMarkdown>
                                 </div>
+                                <button 
+                                  onClick={handleListenMeaning}
+                                  disabled={speaking}
+                                  className="mt-4 flex items-center gap-2 text-blue-700 text-sm font-semibold hover:text-blue-800 transition-colors disabled:opacity-50"
+                                >
+                                  {speaking ? <Loader2 className="w-4 h-4 animate-spin" /> : <Volume2 className="w-4 h-4" />}
+                                  {speaking ? "Speaking..." : "Listen to What This Means For You"}
+                                </button>
                               </div>
                             </section>
                           </div>
