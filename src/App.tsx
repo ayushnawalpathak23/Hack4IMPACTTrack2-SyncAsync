@@ -862,7 +862,8 @@ function MedicalSimplifier() {
         if (selectedVoice) {
           utterance.voice = selectedVoice;
         }
-        utterance.rate = 1;
+        const slowerDialogueLangs = ["bn", "or", "mr"];
+        utterance.rate = slowerDialogueLangs.includes(targetLang) ? 0.8 : 1;
         utterance.onend = () => setSpeaking(false);
         utterance.onerror = () => {
           setSpeaking(false);

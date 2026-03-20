@@ -390,24 +390,62 @@ async function startServer() {
       return res.status(400).json({ error: "No audio provided" });
     }
 
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey || apiKey === "MY_GROQ_API_KEY") {
-      return res.status(500).json({ error: "GROQ_API_KEY is missing or invalid." });
+    const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
+    const groqApiKey = process.env.GROQ_API_KEY;
+    const hasElevenLabs = Boolean(elevenLabsApiKey && elevenLabsApiKey !== "MY_ELEVENLABS_API_KEY");
+    const hasGroq = Boolean(groqApiKey && groqApiKey !== "MY_GROQ_API_KEY");
+
+    if (!hasElevenLabs && !hasGroq) {
+      return res.status(500).json({ error: "No STT provider configured. Set ELEVENLABS_API_KEY or GROQ_API_KEY." });
     }
 
     try {
-      const formData = new FormData();
       const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || "audio/webm" });
-      formData.append("file", audioBlob, req.file.originalname || "speech.webm");
-      formData.append("model", "whisper-large-v3-turbo");
-      formData.append("response_format", "json");
+
+      if (hasElevenLabs) {
+        try {
+          const elevenForm = new FormData();
+          elevenForm.append("file", audioBlob, req.file.originalname || "speech.webm");
+          elevenForm.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
+
+          const elevenResponse = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+            method: "POST",
+            headers: {
+              "xi-api-key": String(elevenLabsApiKey),
+            },
+            body: elevenForm,
+          });
+
+          if (elevenResponse.ok) {
+            const elevenData = await elevenResponse.json() as any;
+            const transcript = String(elevenData?.text || elevenData?.transcript || "").trim();
+            if (transcript) {
+              return res.json({ text: transcript, provider: "elevenlabs" });
+            }
+          } else {
+            const elevenErrText = await elevenResponse.text();
+            console.error(`ElevenLabs STT failed (${elevenResponse.status}):`, elevenErrText);
+          }
+        } catch (elevenErr) {
+          console.error("ElevenLabs STT exception, falling back to Groq:", elevenErr);
+        }
+      }
+
+      if (!hasGroq) {
+        return res.status(500).json({ error: "Speech transcription failed with ElevenLabs and GROQ fallback is not configured." });
+      }
+
+      const groqForm = new FormData();
+      groqForm.append("file", audioBlob, req.file.originalname || "speech.webm");
+      groqForm.append("model", "whisper-large-v3-turbo");
+      groqForm.append("response_format", "json");
 
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Bearer ${groqApiKey}`,
         },
-        body: formData,
+        body: groqForm,
       });
 
       if (!response.ok) {
@@ -416,7 +454,7 @@ async function startServer() {
       }
 
       const data = await response.json() as any;
-      res.json({ text: String(data?.text || "") });
+      res.json({ text: String(data?.text || ""), provider: "groq" });
     } catch (err) {
       console.error("Speech transcription error:", err);
       res.status(500).json({ error: "Speech-to-text transcription failed" });
@@ -718,14 +756,22 @@ async function startServer() {
         or: process.env.ELEVENLABS_VOICE_ID_OR,
       };
       const elevenLabsVoiceId = languageVoiceMap[languageKey] || indianVoiceFallback || defaultVoiceId;
+      const requiresDialoguePacing = ["bn", "or", "mr"].includes(languageKey);
+      const MAX_ELEVENLABS_CHARS = 9500;
 
       let spokenText = String(text);
+      if (spokenText.length > MAX_ELEVENLABS_CHARS) {
+        spokenText = spokenText.substring(0, MAX_ELEVENLABS_CHARS).trim();
+      }
+
       {
         try {
           const rewriteInstruction =
             languageKey === "en"
               ? "Rewrite medical text for clear spoken narration in Indian English. Keep meaning intact, expand abbreviations naturally, and break long sentences into short sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text."
-              : "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, expand abbreviations naturally, and break long sentences into shorter sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text.";
+              : requiresDialoguePacing
+                ? "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, and add natural dialogue pause punctuation (commas, ellipses, question marks). Break sentences sparingly to keep text compact. Make it sound like calm dialogue narration. Return only rewritten text, do not expand length unnecessarily."
+                : "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, expand abbreviations naturally, and break long sentences into shorter sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text.";
           const spokenRewrite = await generateWithGroq(
             [
               {
@@ -740,7 +786,11 @@ async function startServer() {
             false
           );
           if (spokenRewrite?.trim()) {
-            spokenText = spokenRewrite.trim();
+            let rewritten = spokenRewrite.trim();
+            if (rewritten.length > MAX_ELEVENLABS_CHARS) {
+              rewritten = rewritten.substring(0, MAX_ELEVENLABS_CHARS).trim();
+            }
+            spokenText = rewritten;
           }
         } catch (rewriteErr) {
           console.error("TTS spoken-text rewrite failed, using original text:", rewriteErr);
@@ -758,7 +808,7 @@ async function startServer() {
             },
             body: JSON.stringify({
               text: spokenText,
-              model_id: "eleven_multilingual_v2",
+              model_id: "eleven_v3",
               voice_settings: {
                 stability: 0.45,
                 similarity_boost: 0.75,
@@ -800,7 +850,7 @@ async function startServer() {
           : { languageCode, ssmlGender: 'NEUTRAL' as const },
         audioConfig: {
           audioEncoding: 'MP3' as const,
-          speakingRate: (languageKey !== "en" && languageKey !== "hi") ? 0.82 : 0.95,
+          speakingRate: requiresDialoguePacing ? 0.72 : ((languageKey !== "en" && languageKey !== "hi") ? 0.82 : 0.95),
         },
       };
 
