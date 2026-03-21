@@ -13,6 +13,7 @@ const { Translate } = v2;
 import { TextToSpeechClient } from "@google-cloud/text-to-speech";
 import { v2 as cloudinary } from "cloudinary";
 import multer from "multer";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -60,6 +61,98 @@ type GroqMessage = {
   role: "system" | "user" | "assistant";
   content: any;
 };
+
+const objectIdParamSchema = z.object({
+  id: z.string().trim().min(1, "id is required"),
+});
+
+const authBodySchema = z.object({
+  username: z.string().trim().min(3, "username must be at least 3 characters").max(64, "username is too long"),
+  password: z.string().min(6, "password must be at least 6 characters").max(128, "password is too long"),
+});
+
+const concernSeveritySchema = z.enum(["Normal", "Caution", "Critical"]);
+
+const concernSchema = z.object({
+  item: z.string().trim().min(1, "concern item is required"),
+  severity: concernSeveritySchema,
+});
+
+const simplifiedDataSchema = z.object({
+  summary: z.string().trim().min(1, "summary is required"),
+  concerns: z.array(concernSchema).default([]),
+  meaning: z.string().trim().min(1, "meaning is required"),
+});
+
+const createReportBodySchema = z.object({
+  title: z.string().trim().min(1, "title is required").max(200, "title is too long"),
+  originalText: z.string().trim().min(1, "originalText is required"),
+  simplifiedData: simplifiedDataSchema,
+  fileUrl: z.string().trim().optional().default(""),
+});
+
+const updateReportTitleBodySchema = z.object({
+  title: z.string().trim().min(1, "title is required").max(200, "title is too long"),
+});
+
+const messageBodySchema = z.object({
+  role: z.enum(["user", "model"]),
+  text: z.string().trim().min(1, "text is required").max(10000, "text is too long"),
+});
+
+const aiSimplifyBodySchema = z.object({
+  reportText: z.string().trim().optional().default(""),
+  fileUrl: z.string().trim().optional().default(""),
+  fileName: z.string().trim().optional().default(""),
+  imageDataUrls: z.array(z.string()).optional().default([]),
+}).refine((data) => {
+  return Boolean(data.reportText || data.fileUrl || data.imageDataUrls.length > 0);
+}, {
+  message: "Missing report content, fileUrl, or images",
+  path: ["reportText"],
+});
+
+const aiChatBodySchema = z.object({
+  messageText: z.string().trim().min(1, "messageText is required").max(10000, "messageText is too long"),
+  currentReport: z.object({
+    originalText: z.string().optional().default(""),
+    simplifiedData: z.object({
+      summary: z.string().optional().default(""),
+    }).passthrough(),
+  }).passthrough(),
+  currentHistory: z.array(z.object({
+    role: z.enum(["user", "model"]),
+    text: z.string(),
+  })).optional().default([]),
+});
+
+const translateBodySchema = z.object({
+  text: z.string().min(1, "text is required"),
+  targetLanguage: z.string().trim().min(2, "targetLanguage is required").max(32, "targetLanguage is too long"),
+});
+
+const ttsBodySchema = z.object({
+  text: z.string().trim().min(1, "text is required").max(15000, "text is too long"),
+  targetLang: z.string().trim().optional().default("en"),
+});
+
+function formatZodIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => `${issue.path.length ? issue.path.join(".") : "payload"}: ${issue.message}`)
+    .join("; ");
+}
+
+function validatePayload<T>(schema: z.ZodType<T>, payload: unknown, res: express.Response, source: string): T | null {
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: `Invalid ${source}`,
+      details: formatZodIssues(parsed.error),
+    });
+    return null;
+  }
+  return parsed.data;
+}
 
 function extractJsonObject(text: string): string {
   const first = text.indexOf("{");
@@ -148,11 +241,9 @@ async function startServer() {
 
   // Local auth routes (Passport + passport-local-mongoose)
   app.post("/api/auth/signup", async (req, res) => {
-    const { username, password } = req.body || {};
-
-    if (!username || !password) {
-      return res.status(400).json({ error: "Username and password are required" });
-    }
+    const authBody = validatePayload(authBodySchema, req.body, res, "request body");
+    if (!authBody) return;
+    const { username, password } = authBody;
 
     try {
       const registeredUser = await (User as any).register(new User({ username }), password);
@@ -179,6 +270,10 @@ async function startServer() {
   });
 
   app.post("/api/auth/login", (req, res, next) => {
+    const authBody = validatePayload(authBodySchema, req.body, res, "request body");
+    if (!authBody) return;
+    req.body = authBody;
+
     passport.authenticate("local", (err: unknown, user: any, info: any) => {
       if (err) {
         console.error("Login auth error:", err);
@@ -259,11 +354,9 @@ async function startServer() {
   app.post("/api/reports", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-    const { title, originalText, simplifiedData, fileUrl } = req.body || {};
-
-    if (!title || !originalText || !simplifiedData?.summary || !simplifiedData?.meaning) {
-      return res.status(400).json({ error: "Missing report data" });
-    }
+    const body = validatePayload(createReportBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { title, originalText, simplifiedData, fileUrl } = body;
 
     const report = await ReportModel.create({
       ownerId,
@@ -289,12 +382,12 @@ async function startServer() {
   app.patch("/api/reports/:id", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-    const { id } = req.params;
-    const { title } = req.body || {};
-
-    if (!title?.trim()) {
-      return res.status(400).json({ error: "Title is required" });
-    }
+    const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
+    if (!params) return;
+    const body = validatePayload(updateReportTitleBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { id } = params;
+    const { title } = body;
 
     const updated = await ReportModel.findOneAndUpdate(
       { _id: id, ownerId },
@@ -312,7 +405,9 @@ async function startServer() {
   app.delete("/api/reports/:id", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-    const { id } = req.params;
+    const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
+    if (!params) return;
+    const { id } = params;
 
     const deleted = await ReportModel.findOneAndDelete({ _id: id, ownerId });
     if (!deleted) {
@@ -326,7 +421,9 @@ async function startServer() {
   app.get("/api/reports/:id/messages", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-    const { id } = req.params;
+    const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
+    if (!params) return;
+    const { id } = params;
 
     const report = await ReportModel.findOne({ _id: id, ownerId }).lean();
     if (!report) {
@@ -347,12 +444,12 @@ async function startServer() {
   app.post("/api/reports/:id/messages", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-    const { id } = req.params;
-    const { role, text } = req.body || {};
-
-    if ((role !== "user" && role !== "model") || !text?.trim()) {
-      return res.status(400).json({ error: "Invalid message payload" });
-    }
+    const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
+    if (!params) return;
+    const body = validatePayload(messageBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { id } = params;
+    const { role, text } = body;
 
     const report = await ReportModel.findOne({ _id: id, ownerId }).lean();
     if (!report) {
@@ -363,7 +460,7 @@ async function startServer() {
       reportId: id,
       ownerId,
       role,
-      text: text.trim(),
+      text,
     });
 
     res.json({
@@ -388,6 +485,10 @@ async function startServer() {
   app.post("/api/stt", upload.single("audio"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No audio provided" });
+    }
+
+    if (!req.file.mimetype.startsWith("audio/")) {
+      return res.status(400).json({ error: "Invalid audio file format" });
     }
 
     const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
@@ -467,6 +568,11 @@ async function startServer() {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
+    const allowedMimes = new Set(["image/jpeg", "image/jpg", "image/png", "application/pdf"]);
+    if (!allowedMimes.has(req.file.mimetype)) {
+      return res.status(400).json({ error: "Only JPEG, PNG, and PDF files are supported." });
+    }
+
     try {
       const b64 = Buffer.from(req.file.buffer).toString("base64");
       const dataURI = "data:" + req.file.mimetype + ";base64," + b64;
@@ -483,16 +589,14 @@ async function startServer() {
 
   // AI simplify route (Groq)
   app.post("/api/ai/simplify", async (req, res) => {
-    const { reportText, fileUrl, fileName, imageDataUrls } = req.body;
-
-    if (!reportText && !fileUrl && (!Array.isArray(imageDataUrls) || imageDataUrls.length === 0)) {
-      return res.status(400).json({ error: "Missing report content, fileUrl, or images" });
-    }
+    const body = validatePayload(aiSimplifyBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { reportText, fileUrl, fileName, imageDataUrls } = body;
 
     try {
-      const systemPrompt = "You are a medical expert who simplifies complex medical reports for patients. Respond strictly in JSON with keys: summary, concerns, meaning.";
+      const systemPrompt = "You are a medical expert who creates comprehensive, detailed patient-friendly explanations for medical reports. Include all important clinical findings, test results, measurements, and professional interpretations. Your summaries should be thorough and include complete information from the report. Respond strictly in JSON with keys: summary, concerns, meaning.";
       const userPromptText = [
-        "Create a patient-friendly explanation for this medical report.",
+        "Create a comprehensive, detailed patient-friendly explanation for this medical report. Include all important findings, test results, measurements, and clinical information. The summary should be thorough and include all key details from the report.",
         reportText ? `Report text: ${reportText}` : "No pasted report text provided.",
         fileUrl ? `Uploaded file URL: ${fileUrl}` : "No uploaded file URL provided.",
         Array.isArray(imageDataUrls) && imageDataUrls.length > 0 ? `Attached image pages: ${imageDataUrls.length}` : "No attached image pages.",
@@ -568,10 +672,9 @@ async function startServer() {
 
   // AI chat route (Groq)
   app.post("/api/ai/chat", async (req, res) => {
-    const { messageText, currentReport, currentHistory } = req.body;
-    if (!messageText || !currentReport) {
-      return res.status(400).json({ error: "Missing messageText or currentReport" });
-    }
+    const body = validatePayload(aiChatBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { messageText, currentReport, currentHistory } = body;
 
     try {
       const systemPrompt = [
@@ -608,10 +711,9 @@ async function startServer() {
 
   // Translation route
   app.post("/api/translate", async (req, res) => {
-    const { text, targetLanguage } = req.body;
-    if (!text || !targetLanguage) {
-      return res.status(400).json({ error: "Missing text or targetLanguage" });
-    }
+    const body = validatePayload(translateBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { text, targetLanguage } = body;
 
     try {
       let parsedJson: any = null;
@@ -711,10 +813,9 @@ async function startServer() {
 
   // TTS route
   app.post("/api/tts", async (req, res) => {
-    const { text, targetLang } = req.body;
-    if (!text) {
-      return res.status(400).json({ error: "Missing text" });
-    }
+    const body = validatePayload(ttsBodySchema, req.body, res, "request body");
+    if (!body) return;
+    const { text, targetLang } = body;
 
     const ttsLanguageMap: Record<string, string> = {
       en: "en-US",
