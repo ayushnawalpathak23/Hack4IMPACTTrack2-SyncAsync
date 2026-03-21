@@ -15,9 +15,13 @@ import { v2 as cloudinary } from "cloudinary";
 import multer from "multer";
 import { z } from "zod";
 
-dotenv.config();
+if (process.env.NODE_ENV !== "production") {
+  dotenv.config();
+}
 
 const app = express();
+app.set("trust proxy", 1);
+
 const PORT = 3000;
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/medicode";
@@ -222,7 +226,7 @@ async function startServer() {
     cookie: {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       maxAge: 1000 * 60 * 60 * 24 * 7,
     },
   }));
@@ -234,12 +238,10 @@ async function startServer() {
   app.use(passport.initialize());
   app.use(passport.session());
 
-  // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // Local auth routes (Passport + passport-local-mongoose)
   app.post("/api/auth/signup", async (req, res) => {
     const authBody = validatePayload(authBodySchema, req.body, res, "request body");
     if (!authBody) return;
@@ -252,7 +254,6 @@ async function startServer() {
           console.error("Signup login session error:", err);
           return res.status(500).json({ error: "User created, but session initialization failed" });
         }
-
         return res.json({
           user: {
             id: registeredUser._id,
@@ -279,17 +280,14 @@ async function startServer() {
         console.error("Login auth error:", err);
         return res.status(500).json({ error: "Login failed" });
       }
-
       if (!user) {
         return res.status(401).json({ error: info?.message || "Invalid username or password" });
       }
-
       (req as any).login(user, (loginErr: unknown) => {
         if (loginErr) {
           console.error("Login session error:", loginErr);
           return res.status(500).json({ error: "Login session failed" });
         }
-
         return res.json({
           user: {
             id: user._id,
@@ -315,7 +313,6 @@ async function startServer() {
     if (!authReq.isAuthenticated || !authReq.isAuthenticated()) {
       return res.status(401).json({ user: null });
     }
-
     const user = authReq.user;
     return res.json({
       user: {
@@ -336,7 +333,6 @@ async function startServer() {
   app.get("/api/reports", requireAuth, async (req, res) => {
     const authReq = req as any;
     const ownerId = authReq.user._id;
-
     const reports = await ReportModel.find({ ownerId }).sort({ createdAt: -1 }).lean();
     res.json({
       reports: reports.map((report: any) => ({
@@ -357,7 +353,6 @@ async function startServer() {
     const body = validatePayload(createReportBodySchema, req.body, res, "request body");
     if (!body) return;
     const { title, originalText, simplifiedData, fileUrl } = body;
-
     const report = await ReportModel.create({
       ownerId,
       title,
@@ -365,7 +360,6 @@ async function startServer() {
       simplifiedData,
       fileUrl: fileUrl || "",
     });
-
     res.json({
       report: {
         id: String(report._id),
@@ -388,17 +382,14 @@ async function startServer() {
     if (!body) return;
     const { id } = params;
     const { title } = body;
-
     const updated = await ReportModel.findOneAndUpdate(
       { _id: id, ownerId },
       { $set: { title: title.trim() } },
       { new: true }
     ).lean();
-
     if (!updated) {
       return res.status(404).json({ error: "Report not found" });
     }
-
     res.json({ ok: true });
   });
 
@@ -408,12 +399,10 @@ async function startServer() {
     const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
     if (!params) return;
     const { id } = params;
-
     const deleted = await ReportModel.findOneAndDelete({ _id: id, ownerId });
     if (!deleted) {
       return res.status(404).json({ error: "Report not found" });
     }
-
     await MessageModel.deleteMany({ reportId: id, ownerId });
     res.json({ ok: true });
   });
@@ -424,12 +413,10 @@ async function startServer() {
     const params = validatePayload(objectIdParamSchema, req.params, res, "request params");
     if (!params) return;
     const { id } = params;
-
     const report = await ReportModel.findOne({ _id: id, ownerId }).lean();
     if (!report) {
       return res.status(404).json({ error: "Report not found" });
     }
-
     const messages = await MessageModel.find({ reportId: id, ownerId }).sort({ createdAt: 1 }).lean();
     res.json({
       messages: messages.map((message: any) => ({
@@ -450,19 +437,11 @@ async function startServer() {
     if (!body) return;
     const { id } = params;
     const { role, text } = body;
-
     const report = await ReportModel.findOne({ _id: id, ownerId }).lean();
     if (!report) {
       return res.status(404).json({ error: "Report not found" });
     }
-
-    const message = await MessageModel.create({
-      reportId: id,
-      ownerId,
-      role,
-      text,
-    });
-
+    const message = await MessageModel.create({ reportId: id, ownerId, role, text });
     res.json({
       message: {
         id: String(message._id),
@@ -473,7 +452,6 @@ async function startServer() {
     });
   });
 
-  // Cloudinary configuration
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
@@ -486,37 +464,29 @@ async function startServer() {
     if (!req.file) {
       return res.status(400).json({ error: "No audio provided" });
     }
-
     if (!req.file.mimetype.startsWith("audio/")) {
       return res.status(400).json({ error: "Invalid audio file format" });
     }
-
     const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
     const groqApiKey = process.env.GROQ_API_KEY;
     const hasElevenLabs = Boolean(elevenLabsApiKey && elevenLabsApiKey !== "MY_ELEVENLABS_API_KEY");
     const hasGroq = Boolean(groqApiKey && groqApiKey !== "MY_GROQ_API_KEY");
-
     if (!hasElevenLabs && !hasGroq) {
       return res.status(500).json({ error: "No STT provider configured. Set ELEVENLABS_API_KEY or GROQ_API_KEY." });
     }
-
     try {
-      const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || "audio/webm" });
-
+      const audioBytes = Uint8Array.from(req.file.buffer);
+      const audioBlob = new Blob([audioBytes], { type: req.file.mimetype || "audio/webm" });
       if (hasElevenLabs) {
         try {
           const elevenForm = new FormData();
           elevenForm.append("file", audioBlob, req.file.originalname || "speech.webm");
           elevenForm.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
-
           const elevenResponse = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
             method: "POST",
-            headers: {
-              "xi-api-key": String(elevenLabsApiKey),
-            },
+            headers: { "xi-api-key": String(elevenLabsApiKey) },
             body: elevenForm,
           });
-
           if (elevenResponse.ok) {
             const elevenData = await elevenResponse.json() as any;
             const transcript = String(elevenData?.text || elevenData?.transcript || "").trim();
@@ -531,29 +501,22 @@ async function startServer() {
           console.error("ElevenLabs STT exception, falling back to Groq:", elevenErr);
         }
       }
-
       if (!hasGroq) {
         return res.status(500).json({ error: "Speech transcription failed with ElevenLabs and GROQ fallback is not configured." });
       }
-
       const groqForm = new FormData();
       groqForm.append("file", audioBlob, req.file.originalname || "speech.webm");
       groqForm.append("model", "whisper-large-v3-turbo");
       groqForm.append("response_format", "json");
-
       const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${groqApiKey}`,
-        },
+        headers: { Authorization: `Bearer ${groqApiKey}` },
         body: groqForm,
       });
-
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Groq STT failed (${response.status}): ${errorText}`);
       }
-
       const data = await response.json() as any;
       res.json({ text: String(data?.text || ""), provider: "groq" });
     } catch (err) {
@@ -562,17 +525,14 @@ async function startServer() {
     }
   });
 
-  // Cloudinary upload route
   app.post("/api/upload", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
     }
-
     const allowedMimes = new Set(["image/jpeg", "image/jpg", "image/png", "application/pdf"]);
     if (!allowedMimes.has(req.file.mimetype)) {
       return res.status(400).json({ error: "Only JPEG, PNG, and PDF files are supported." });
     }
-
     try {
       const b64 = Buffer.from(req.file.buffer).toString("base64");
       const dataURI = "data:" + req.file.mimetype + ";base64," + b64;
@@ -587,12 +547,10 @@ async function startServer() {
     }
   });
 
-  // AI simplify route (Groq)
   app.post("/api/ai/simplify", async (req, res) => {
     const body = validatePayload(aiSimplifyBodySchema, req.body, res, "request body");
     if (!body) return;
     const { reportText, fileUrl, fileName, imageDataUrls } = body;
-
     try {
       const systemPrompt = "You are a medical expert who creates comprehensive, detailed patient-friendly explanations for medical reports. Include all important clinical findings, test results, measurements, and professional interpretations. Your summaries should be thorough and include complete information from the report. Respond strictly in JSON with keys: summary, concerns, meaning.";
       const userPromptText = [
@@ -608,15 +566,11 @@ async function startServer() {
       const attachedImages = Array.isArray(imageDataUrls)
         ? imageDataUrls.filter((url: unknown) => typeof url === "string" && url.startsWith("data:image/"))
         : [];
-
       const hasVisionInput = attachedImages.length > 0;
       const userContent = hasVisionInput
         ? [
             { type: "text", text: userPromptText },
-            ...attachedImages.map((url: string) => ({
-              type: "image_url",
-              image_url: { url },
-            })),
+            ...attachedImages.map((url: string) => ({ type: "image_url", image_url: { url } })),
           ]
         : userPromptText;
 
@@ -639,17 +593,10 @@ async function startServer() {
       const concerns = Array.isArray(parsed?.concerns)
         ? parsed.concerns.map((entry: any) => {
             if (typeof entry === "string") {
-              return {
-                item: entry.trim(),
-                severity: "Normal" as const,
-              };
+              return { item: entry.trim(), severity: "Normal" as const };
             }
-
             const severity = entry?.severity === "Critical" || entry?.severity === "Caution" ? entry.severity : "Normal";
-            return {
-              item: String(entry?.item ?? "").trim(),
-              severity,
-            };
+            return { item: String(entry?.item ?? "").trim(), severity };
           }).filter((entry: { item: string }) => entry.item.length > 0)
         : [];
 
@@ -670,12 +617,10 @@ async function startServer() {
     }
   });
 
-  // AI chat route (Groq)
   app.post("/api/ai/chat", async (req, res) => {
     const body = validatePayload(aiChatBodySchema, req.body, res, "request body");
     if (!body) return;
     const { messageText, currentReport, currentHistory } = body;
-
     try {
       const systemPrompt = [
         "You are a medical assistant helping a patient understand their report.",
@@ -687,10 +632,7 @@ async function startServer() {
       const historyMessages: GroqMessage[] = Array.isArray(currentHistory)
         ? currentHistory
             .filter((m: any) => typeof m?.text === "string" && (m?.role === "user" || m?.role === "model"))
-            .map((m: any) => ({
-              role: m.role === "user" ? "user" : "assistant",
-              content: m.text,
-            }))
+            .map((m: any) => ({ role: m.role === "user" ? "user" : "assistant", content: m.text }))
         : [];
 
       const aiText = await generateWithGroq(
@@ -709,12 +651,10 @@ async function startServer() {
     }
   });
 
-  // Translation route
   app.post("/api/translate", async (req, res) => {
     const body = validatePayload(translateBodySchema, req.body, res, "request body");
     if (!body) return;
     const { text, targetLanguage } = body;
-
     try {
       let parsedJson: any = null;
       let isJsonPayload = false;
@@ -725,12 +665,10 @@ async function startServer() {
         isJsonPayload = false;
       }
 
-      // First try Google Cloud Translation when configured.
       const googleApiKey = process.env.GOOGLE_CLOUD_API_KEY || process.env.GEMINI_API_KEY;
       if (googleApiKey && googleApiKey !== "MY_GOOGLE_CLOUD_API_KEY") {
         try {
           const translate = new Translate({ key: googleApiKey });
-
           if (isJsonPayload) {
             const translatedObj: any = {};
             for (const [key, value] of Object.entries(parsedJson)) {
@@ -762,7 +700,6 @@ async function startServer() {
             }
             return res.json({ translatedText: JSON.stringify(translatedObj) });
           }
-
           const [translation] = await translate.translate(text, targetLanguage);
           return res.json({ translatedText: translation });
         } catch (googleErr) {
@@ -770,29 +707,20 @@ async function startServer() {
         }
       }
 
-      // Fallback: Groq translation, including JSON-safe translation for report payloads.
       if (isJsonPayload) {
         const raw = await generateWithGroq(
           [
-            {
-              role: "system",
-              content: "Translate report JSON values to target language. Keep keys identical. Preserve severity values exactly as one of: Normal, Caution, Critical. Return only valid JSON.",
-            },
-            {
-              role: "user",
-              content: `Target language: ${targetLanguage}\n\nJSON:\n${JSON.stringify(parsedJson)}`,
-            },
+            { role: "system", content: "Translate report JSON values to target language. Keep keys identical. Preserve severity values exactly as one of: Normal, Caution, Critical. Return only valid JSON." },
+            { role: "user", content: `Target language: ${targetLanguage}\n\nJSON:\n${JSON.stringify(parsedJson)}` },
           ],
           true
         );
-
         let translatedJson: any;
         try {
           translatedJson = JSON.parse(raw);
         } catch {
           translatedJson = JSON.parse(extractJsonObject(raw));
         }
-
         return res.json({ translatedText: JSON.stringify(translatedJson) });
       }
 
@@ -803,7 +731,6 @@ async function startServer() {
         ],
         false
       );
-
       return res.json({ translatedText: translatedText.trim() });
     } catch (err) {
       console.error("Translation error:", err);
@@ -811,38 +738,18 @@ async function startServer() {
     }
   });
 
-  // TTS route
   app.post("/api/tts", async (req, res) => {
     const body = validatePayload(ttsBodySchema, req.body, res, "request body");
     if (!body) return;
     const { text, targetLang } = body;
 
     const ttsLanguageMap: Record<string, string> = {
-      en: "en-US",
-      hi: "hi-IN",
-      or: "or-IN",
-      mr: "mr-IN",
-      te: "te-IN",
-      bn: "bn-IN",
-      ta: "ta-IN",
-      kn: "kn-IN",
-      gu: "gu-IN",
-      ml: "ml-IN",
-      pa: "pa-IN",
+      en: "en-US", hi: "hi-IN", or: "or-IN", mr: "mr-IN", te: "te-IN",
+      bn: "bn-IN", ta: "ta-IN", kn: "kn-IN", gu: "gu-IN", ml: "ml-IN", pa: "pa-IN",
     };
-
     const langNameMap: Record<string, string> = {
-      en: "English",
-      hi: "Hindi",
-      or: "Odia",
-      mr: "Marathi",
-      te: "Telugu",
-      bn: "Bengali",
-      ta: "Tamil",
-      kn: "Kannada",
-      gu: "Gujarati",
-      ml: "Malayalam",
-      pa: "Punjabi",
+      en: "English", hi: "Hindi", or: "Odia", mr: "Marathi", te: "Telugu",
+      bn: "Bengali", ta: "Tamil", kn: "Kannada", gu: "Gujarati", ml: "Malayalam", pa: "Punjabi",
     };
 
     try {
@@ -865,37 +772,29 @@ async function startServer() {
         spokenText = spokenText.substring(0, MAX_ELEVENLABS_CHARS).trim();
       }
 
-      {
-        try {
-          const rewriteInstruction =
-            languageKey === "en"
-              ? "Rewrite medical text for clear spoken narration in Indian English. Keep meaning intact, expand abbreviations naturally, and break long sentences into short sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text."
-              : requiresDialoguePacing
-                ? "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, and add natural dialogue pause punctuation (commas, ellipses, question marks). Break sentences sparingly to keep text compact. Make it sound like calm dialogue narration. Return only rewritten text, do not expand length unnecessarily."
-                : "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, expand abbreviations naturally, and break long sentences into shorter sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text.";
-          const spokenRewrite = await generateWithGroq(
-            [
-              {
-                role: "system",
-                content: rewriteInstruction,
-              },
-              {
-                role: "user",
-                content: `Language: ${langNameMap[languageKey] || languageKey}\n\nText:\n${spokenText}`,
-              },
-            ],
-            false
-          );
-          if (spokenRewrite?.trim()) {
-            let rewritten = spokenRewrite.trim();
-            if (rewritten.length > MAX_ELEVENLABS_CHARS) {
-              rewritten = rewritten.substring(0, MAX_ELEVENLABS_CHARS).trim();
-            }
-            spokenText = rewritten;
+      try {
+        const rewriteInstruction =
+          languageKey === "en"
+            ? "Rewrite medical text for clear spoken narration in Indian English. Keep meaning intact, expand abbreviations naturally, and break long sentences into short sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text."
+            : requiresDialoguePacing
+              ? "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, and add natural dialogue pause punctuation (commas, ellipses, question marks). Break sentences sparingly to keep text compact. Make it sound like calm dialogue narration. Return only rewritten text, do not expand length unnecessarily."
+              : "Rewrite medical text for clear spoken narration in the requested language. Keep meaning intact, use native script, reduce English code-switching, expand abbreviations naturally, and break long sentences into shorter sentences with natural pause punctuation so TTS sounds slower and clearer. Return only rewritten text.";
+        const spokenRewrite = await generateWithGroq(
+          [
+            { role: "system", content: rewriteInstruction },
+            { role: "user", content: `Language: ${langNameMap[languageKey] || languageKey}\n\nText:\n${spokenText}` },
+          ],
+          false
+        );
+        if (spokenRewrite?.trim()) {
+          let rewritten = spokenRewrite.trim();
+          if (rewritten.length > MAX_ELEVENLABS_CHARS) {
+            rewritten = rewritten.substring(0, MAX_ELEVENLABS_CHARS).trim();
           }
-        } catch (rewriteErr) {
-          console.error("TTS spoken-text rewrite failed, using original text:", rewriteErr);
+          spokenText = rewritten;
         }
+      } catch (rewriteErr) {
+        console.error("TTS spoken-text rewrite failed, using original text:", rewriteErr);
       }
 
       if (elevenLabsApiKey) {
@@ -910,19 +809,14 @@ async function startServer() {
             body: JSON.stringify({
               text: spokenText,
               model_id: "eleven_v3",
-              voice_settings: {
-                stability: 0.45,
-                similarity_boost: 0.75,
-              },
+              voice_settings: { stability: 0.45, similarity_boost: 0.75 },
             }),
           });
-
           if (elevenResponse.ok) {
             const audioArrayBuffer = await elevenResponse.arrayBuffer();
             const audioBase64 = Buffer.from(audioArrayBuffer).toString("base64");
             return res.json({ audioData: audioBase64 });
           }
-
           const elevenErr = await elevenResponse.text();
           console.error("ElevenLabs TTS failed, falling back to Google TTS:", elevenErr);
         } catch (elevenCatchErr) {
@@ -932,7 +826,7 @@ async function startServer() {
 
       const apiKey = process.env.GOOGLE_CLOUD_API_KEY || process.env.GEMINI_API_KEY;
       if (!apiKey || apiKey === "MY_GOOGLE_CLOUD_API_KEY") {
-        console.error("No usable TTS provider configured. Set ELEVENLABS_API_KEY or enable Google Cloud TTS.");
+        console.error("No usable TTS provider configured.");
         return res.status(500).json({ error: "No usable TTS provider configured." });
       }
 
@@ -943,24 +837,21 @@ async function startServer() {
         hi: "hi-IN-Standard-A",
       };
       const preferredGoogleVoice = googleVoiceNameMap[languageKey];
-      
       const request = {
         input: { text: spokenText },
         voice: preferredGoogleVoice
           ? { languageCode, name: preferredGoogleVoice }
-          : { languageCode, ssmlGender: 'NEUTRAL' as const },
+          : { languageCode, ssmlGender: "NEUTRAL" as const },
         audioConfig: {
-          audioEncoding: 'MP3' as const,
-          speakingRate: requiresDialoguePacing ? 0.72 : ((languageKey !== "en" && languageKey !== "hi") ? 0.82 : 0.95),
+          audioEncoding: "MP3" as const,
+          speakingRate: requiresDialoguePacing ? 0.72 : (languageKey !== "en" && languageKey !== "hi" ? 0.82 : 0.95),
         },
       };
 
       const [response] = await client.synthesizeSpeech(request);
       const audioContent = response.audioContent;
-      
       if (audioContent) {
-        // audioContent is a Uint8Array, convert to base64
-        const audioBase64 = Buffer.from(audioContent).toString('base64');
+        const audioBase64 = Buffer.from(audioContent).toString("base64");
         res.json({ audioData: audioBase64 });
       } else {
         res.status(500).json({ error: "TTS failed to generate audio" });
@@ -971,7 +862,6 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
